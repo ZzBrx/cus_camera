@@ -1,6 +1,5 @@
-package com.ruide.camera
+package com.ruide.camera.event
 
-import com.ruide.aidl.para.CAM
 
 /**
  * 对外业务事件：低频，供 ImpCAMService 订阅。
@@ -9,19 +8,19 @@ import com.ruide.aidl.para.CAM
 sealed class CameraEvent {
     /** 相机已连接 */
     data class Connected(
-        val cameraType: CAM.CAM_ID_TYPE,
+        val cameraId: Int,
         val productId: Int
     ) : CameraEvent()
 
     /** 相机已断开 */
     data class Disconnected(
-        val cameraType: CAM.CAM_ID_TYPE,
+        val cameraId: Int,
         val reason: DisconnectReason
     ) : CameraEvent()
 
     /** 相机出错 */
     data class Error(
-        val cameraType: CAM.CAM_ID_TYPE,
+        val cameraId: Int,
         val message: String
     ) : CameraEvent()
 }

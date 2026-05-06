@@ -1,4 +1,6 @@
-package com.ruide.camera
+package com.ruide.service.camera.event
+
+import com.ruide.camera.event.DisconnectReason
 
 /**
  * 内部系统事件：用于 CameraSessionManager 内部模块间通信。

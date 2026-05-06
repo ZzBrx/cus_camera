@@ -1,9 +1,7 @@
-package com.ruide.service
+package com.ruide.camera.session
 
 import android.util.Log
 import android.view.Surface
-import com.ruide.aidl.para.CAM
-
 /**
  * 管理 AIDL 客户端与相机/预览/推流的归属关系。
  *
@@ -20,7 +18,7 @@ class CameraSessionRegistry {
         private const val TAG = "CameraSessionRegistry"
     }
 
-    data class PreviewKey(val cid: Long, val cameraType: CAM.CAM_ID_TYPE)
+    data class PreviewKey(val cid: Long, val cameraId: Int)
 
     enum class UnregisterResult {
         OK,
@@ -31,44 +29,44 @@ class CameraSessionRegistry {
     private val lock = Any()
 
     // cid → 该客户端已打开的相机集合
-    private val clientCameras = HashMap<Long, MutableSet<CAM.CAM_ID_TYPE>>()
+    private val clientCameras = HashMap<Long, MutableSet<Int>>()
 
-    // cameraType → 当前持有该相机的客户端数量（增量维护，O(1) 查询）
-    private val clientCountByCamera = HashMap<CAM.CAM_ID_TYPE, Int>()
+    // cameraId → 当前持有该相机的客户端数量（增量维护，O(1) 查询）
+    private val clientCountByCamera = HashMap<Int, Int>()
 
     // PreviewKey → Surface
     private val clientPreviews = HashMap<PreviewKey, Surface>()
 
-    // cameraType → 发起推流的 clientId
-    private val mediaOwners = HashMap<CAM.CAM_ID_TYPE, Long>()
+    // cameraId → 发起推流的 clientId
+    private val mediaOwners = HashMap<Int, Long>()
 
     // ========================= 相机归属 =========================
 
-    fun registerCamera(cid: Long, cameraType: CAM.CAM_ID_TYPE): Boolean = synchronized(lock) {
-        val added = clientCameras.getOrPut(cid) { mutableSetOf() }.add(cameraType)
+    fun registerCamera(cid: Long, cameraId: Int): Boolean = synchronized(lock) {
+        val added = clientCameras.getOrPut(cid) { mutableSetOf() }.add(cameraId)
         if (added) {
-            clientCountByCamera[cameraType] = (clientCountByCamera[cameraType] ?: 0) + 1
-            Log.d(TAG, "registerCamera: cid=$cid, cameraType=$cameraType, count=${clientCountByCamera[cameraType]}")
+            clientCountByCamera[cameraId] = (clientCountByCamera[cameraId] ?: 0) + 1
+            Log.d(TAG, "registerCamera: cid=$cid, cameraType=$cameraId, count=${clientCountByCamera[cameraId]}")
         }
         added
     }
 
-    fun rollbackCamera(cid: Long, cameraType: CAM.CAM_ID_TYPE) = synchronized(lock) {
+    fun rollbackCamera(cid: Long, cameraId: Int) = synchronized(lock) {
         val set = clientCameras[cid] ?: return@synchronized
-        if (set.remove(cameraType)) {
-            val count = (clientCountByCamera[cameraType] ?: 1) - 1
+        if (set.remove(cameraId)) {
+            val count = (clientCountByCamera[cameraId] ?: 1) - 1
             if (count <= 0) {
-                clientCountByCamera.remove(cameraType)
+                clientCountByCamera.remove(cameraId)
             } else {
-                clientCountByCamera[cameraType] = count
+                clientCountByCamera[cameraId] = count
             }
         }
         if (set.isEmpty()) clientCameras.remove(cid)
     }
 
-    fun unregisterCamera(cid: Long, cameraType: CAM.CAM_ID_TYPE): UnregisterResult = synchronized(lock) {
+    fun unregisterCamera(cid: Long, cameraId: Int): UnregisterResult = synchronized(lock) {
         val set = clientCameras[cid]
-        if (set == null || !set.remove(cameraType)) {
+        if (set == null || !set.remove(cameraId)) {
             return UnregisterResult.NOT_FOUND
         }
         if (set.isEmpty()) {
@@ -77,72 +75,72 @@ class CameraSessionRegistry {
         }
 
         // 同步更新计数
-        val count = (clientCountByCamera[cameraType] ?: 1) - 1
+        val count = (clientCountByCamera[cameraId] ?: 1) - 1
         if (count <= 0) {
-            clientCountByCamera.remove(cameraType)
+            clientCountByCamera.remove(cameraId)
         } else {
-            clientCountByCamera[cameraType] = count
+            clientCountByCamera[cameraId] = count
         }
 
-        val hadMedia = mediaOwners[cameraType] == cid && mediaOwners.remove(cameraType) != null
+        val hadMedia = mediaOwners[cameraId] == cid && mediaOwners.remove(cameraId) != null
         if (hadMedia) {
-            Log.i(TAG, "unregisterCamera: cid=$cid 注销时移除推流会话 $cameraType")
+            Log.i(TAG, "unregisterCamera: cid=$cid 注销时移除推流会话 $cameraId")
             UnregisterResult.NEED_STOP_MEDIA
         } else {
             UnregisterResult.OK
         }
     }
 
-    fun isOwner(cid: Long, cameraType: CAM.CAM_ID_TYPE): Boolean = synchronized(lock) {
-        clientCameras[cid]?.contains(cameraType) == true
+    fun isOwner(cid: Long, cameraId: Int): Boolean = synchronized(lock) {
+        clientCameras[cid]?.contains(cameraId) == true
     }
 
     /**
      * O(1) 查询指定 cameraType 的引用计数。
      * SSOT：此值直接从归属关系派生，无独立存储。
      */
-    fun getClientCount(cameraType: CAM.CAM_ID_TYPE): Int = synchronized(lock) {
-        clientCountByCamera[cameraType] ?: 0
+    fun getClientCount(cameraId: Int): Int = synchronized(lock) {
+        clientCountByCamera[cameraId] ?: 0
     }
 
     // ========================= 预览归属 =========================
 
-    fun registerPreview(cid: Long, cameraType: CAM.CAM_ID_TYPE, surface: Surface) = synchronized(lock) {
-        clientPreviews[PreviewKey(cid, cameraType)] = surface
+    fun registerPreview(cid: Long, cameraId: Int, surface: Surface) = synchronized(lock) {
+        clientPreviews[PreviewKey(cid, cameraId)] = surface
     }
 
-    fun unregisterPreview(cid: Long, cameraType: CAM.CAM_ID_TYPE): Surface? = synchronized(lock) {
-        clientPreviews.remove(PreviewKey(cid, cameraType))
+    fun unregisterPreview(cid: Long, cameraId: Int): Surface? = synchronized(lock) {
+        clientPreviews.remove(PreviewKey(cid, cameraId))
     }
 
-    fun getPreview(cid: Long, cameraType: CAM.CAM_ID_TYPE): Surface? = synchronized(lock) {
-        clientPreviews[PreviewKey(cid, cameraType)]
+    fun getPreview(cid: Long, cameraId: Int): Surface? = synchronized(lock) {
+        clientPreviews[PreviewKey(cid, cameraId)]
     }
 
     // ========================= 推流归属 =========================
 
-    fun registerMedia(cid: Long, cameraType: CAM.CAM_ID_TYPE) = synchronized(lock) {
-        mediaOwners[cameraType] = cid
+    fun registerMedia(cid: Long, cameraId: Int) = synchronized(lock) {
+        mediaOwners[cameraId] = cid
     }
 
-    fun unregisterMedia(cameraType: CAM.CAM_ID_TYPE): Boolean = synchronized(lock) {
-        mediaOwners.remove(cameraType) != null
+    fun unregisterMedia(cameraId: Int): Boolean = synchronized(lock) {
+        mediaOwners.remove(cameraId) != null
     }
 
-    fun unregisterAllMedia(): List<CAM.CAM_ID_TYPE> = synchronized(lock) {
+    fun unregisterAllMedia(): List<Int> = synchronized(lock) {
         mediaOwners.keys.toList().also { mediaOwners.clear() }
     }
 
     // ========================= 批量清理 =========================
 
-    fun releaseAllForCamera(cameraType: CAM.CAM_ID_TYPE): List<PreviewKey> = synchronized(lock) {
-        mediaOwners.remove(cameraType)
-        val keys = clientPreviews.keys.filter { it.cameraType == cameraType }
+    fun releaseAllForCamera(cameraId: Int): List<PreviewKey> = synchronized(lock) {
+        mediaOwners.remove(cameraId)
+        val keys = clientPreviews.keys.filter { it.cameraId == cameraId }
         keys.forEach { clientPreviews.remove(it) }
-        clientCameras.values.forEach { it.remove(cameraType) }
+        clientCameras.values.forEach { it.remove(cameraId) }
         clientCameras.entries.removeIf { it.value.isEmpty() }
-        clientCountByCamera.remove(cameraType) // 强制清零
-        Log.i(TAG, "releaseAllForCamera: $cameraType 已清理 ${keys.size} 个预览绑定")
+        clientCountByCamera.remove(cameraId) // 强制清零
+        Log.i(TAG, "releaseAllForCamera: $cameraId 已清理 ${keys.size} 个预览绑定")
         keys
     }
 }

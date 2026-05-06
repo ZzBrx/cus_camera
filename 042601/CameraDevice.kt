@@ -1,4 +1,4 @@
-package com.ruide.camera
+package com.ruide.camera.device
 
 import android.graphics.SurfaceTexture
 import android.hardware.usb.UsbDevice
@@ -8,11 +8,10 @@ import com.ruide.camera.usb.IFrameCallback
 import com.ruide.camera.usb.Size
 import com.ruide.camera.usb.USBMonitor
 import com.ruide.camera.usb.UVCCamera
+import com.ruide.service.camera.event.CameraHardwareCallback
 import org.opencv.android.Utils
 import java.nio.ByteBuffer
-import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -20,6 +19,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import java.util.stream.Collectors
 
 /**
  * 单个 USB 相机设备的生命周期管理（精简版）。
@@ -67,6 +67,30 @@ class CameraDevice(
 
     @Volatile
     private var mZoomFactor: Int = 1
+
+    /** 画面翻转模式 */
+    enum class FlipMode {
+        NONE,           // 不翻转
+        HORIZONTAL,     // 水平翻转（镜像）
+        VERTICAL,       // 垂直翻转
+        BOTH            // 水平+垂直（旋转180度）
+    }
+
+    @Volatile
+    private var flipMode: FlipMode = FlipMode.NONE
+
+    /**
+     * 设置画面翻转模式。
+     */
+    fun setFlipMode(mode: FlipMode) {
+        flipMode = mode
+        Log.d(TAG, "setFlipMode: $mode")
+    }
+
+    /**
+     * 获取当前翻转模式。
+     */
+    fun getFlipMode(): FlipMode = flipMode
 
     // ========================= 帧分发 =========================
 
@@ -285,21 +309,26 @@ class CameraDevice(
         val zoom = mZoomFactor
         val w = mWidth
         val h = mHeight
-        val frameData = if (zoom > 1) {
+
+        // 1. 缩放裁剪
+        var frameData = if (zoom > 1) {
             Utils.cropAndScaleNV21(rawData, w, h, zoom)
         } else {
             rawData
         }
 
-        // 截帧请求
+        // 2. 翻转
+        frameData = applyFlip(frameData, w, h)
+
+        // 3. 截帧
         fulfillCaptureRequest(frameData)
 
-        // 分发给各 Surface
+        // 4. 渲染
         for ((key, slot) in surfaceSlots) {
             scheduleRender(key, slot, frameData, w, h)
         }
 
-        // 通知硬件回调
+        // 5. 硬件回调
         hardwareCallback.onFrameData(frameData, w, h)
     }
 
@@ -308,7 +337,23 @@ class CameraDevice(
         while (iter.hasNext()) {
             val key = iter.next()
             iter.remove()
-            removeClientSurface(key)
+
+            // 直接移除，不调用 surface.release()（避免异常）
+            val slot = surfaceSlots.remove(key)
+            if (slot != null) {
+                slot.active.set(false)
+                slot.executor.shutdownNow()
+            }
+        }
+
+        // 如果所有 Surface 都移除了，停止预览
+        if (surfaceSlots.isEmpty() && isOpened()) {
+            try {
+                mCamera?.stopPreview()
+                mCamera?.setFrameCallback(null, UVCCamera.PIXEL_FORMAT_YUV420SP)
+            } catch (e: Exception) {
+                Log.e(TAG, "停止预览失败", e)
+            }
         }
     }
 
@@ -335,6 +380,14 @@ class CameraDevice(
     ) {
         if (!slot.active.get() || slot.executor.isShutdown) return
 
+        // 快速检查 Surface 有效性，无效直接标记移除
+        if (!slot.surface.isValid) {
+            pendingRemovals.add(clientKey)
+            return
+        }
+
+        val dataCopy = frameData.copyOf()
+
         try {
             slot.executor.execute {
                 if (!slot.active.get()) return@execute
@@ -343,13 +396,18 @@ class CameraDevice(
                     return@execute
                 }
                 try {
-                    Utils.renderYuvToSurface(ByteBuffer.wrap(frameData), slot.surface, w, h)
+                    Utils.renderYuvToSurface(ByteBuffer.wrap(dataCopy), slot.surface, w, h)
                 } catch (e: Exception) {
-                    Log.e(TAG, "渲染到 Surface 失败: $clientKey", e)
+                    Log.e(TAG, "渲染到 Surface 失败: $clientKey, ${e.message}")
+                    // 渲染失败，标记移除
+                    pendingRemovals.add(clientKey)
                 }
             }
         } catch (e: Exception) {
-            Log.d(TAG, "scheduleRender: executor 已关闭, key=$clientKey")
+            // executor 已关闭
+            if (e is java.util.concurrent.RejectedExecutionException) {
+                pendingRemovals.add(clientKey)
+            }
         }
     }
 
@@ -391,9 +449,49 @@ class CameraDevice(
     fun getSupportedSizes(): List<Size> {
         synchronized(resizeLock) {
             val camera = mCamera ?: return emptyList()
-            // ... 实现与原 CameraDevice 相同，此处省略详细实现 ...
-            return emptyList()
+            val raw: List<Size> = camera.supportedSizeList
+            try {
+                camera.stopPreview()
+            } catch (ignored: java.lang.Exception) {
+            }
+
+            val verified: List<Size> = negotiateSizes(raw)
+            try {
+                camera.setPreviewSize(mWidth, mHeight, UVCCamera.FRAME_FORMAT_MJPEG)
+                if (!surfaceSlots.isEmpty()) {
+                    camera.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_YUV420SP)
+                    camera.startPreview()
+                }
+            } catch (e: java.lang.Exception) {
+                Log.e(TAG, "getSupportedSizes: 恢复预览失败", e)
+            }
+
+            Log.i(TAG, "getSupportedSizes: 原始=" + raw.size + "个, 实际可用=" + verified.size + "个 "
+                    + verified.stream().map { s: Size -> s.width.toString() + "x" + s.height }
+                .collect(Collectors.joining(", ", "[", "]"))
+            )
+            return verified
         }
+    }
+
+    private fun negotiateSizes(raw: List<Size>): List<Size> {
+        val verified: MutableList<Size> = ArrayList()
+        val seen: MutableSet<String> = HashSet()
+        for (size in raw) {
+            val key = size.width.toString() + "x" + size.height
+            if (!seen.add(key)) {
+                Log.d(TAG, "negotiateSizes: 跳过重复分辨率 $key")
+                continue
+            }
+            try {
+                mCamera!!.setPreviewSize(size.width, size.height, UVCCamera.FRAME_FORMAT_MJPEG)
+                verified.add(size)
+                Log.d(TAG, "negotiateSizes: 验证通过 $key")
+            } catch (e: java.lang.Exception) {
+                Log.d(TAG, "negotiateSizes: 跳过不可用分辨率 " + key + " (" + e.message + ")")
+            }
+        }
+        return verified
     }
 
     fun resetPreview(width: Int, height: Int): Boolean {
@@ -477,15 +575,98 @@ class CameraDevice(
         }
     }
 
-    fun getCommonOrder(pages: Int): Boolean {
-        val camera = mCamera ?: return false
-        return try {
-            camera.getCommonOrder(pages)
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "getCommonOrder 失败", e)
-            false
+    fun getCommonOrder(pages: Int): Int {
+        val camera = mCamera ?: return -1
+        return camera.getCommonOrder(pages)
+    }
+
+    private fun applyFlip(data: ByteArray, width: Int, height: Int): ByteArray {
+        if (flipMode == FlipMode.NONE) {
+            return data
         }
+
+        Log.d(TAG, "applyFlip: mode=$flipMode, size=${data.size}, ${width}x${height}, expectedSize=${width * height * 3 / 2}")
+
+        val result = when (flipMode) {
+            FlipMode.HORIZONTAL -> flipHorizontalNV21(data, width, height)
+            FlipMode.VERTICAL -> flipVerticalNV21(data, width, height)
+            FlipMode.BOTH -> flipBothNV21(data, width, height)
+            else -> data
+        }
+
+        Log.d(TAG, "applyFlip: result size=${result.size}")
+        return result
+    }
+
+    /**
+     * NV21 水平翻转（左右镜像）。
+     *
+     * NV21 格式：
+     * - Y 平面: w * h 字节，逐行存储
+     * - UV 平面: w * h / 2 字节，UVUVUV... 交错，每 2 字节对应 2 个水平相邻像素
+     */
+    private fun flipHorizontalNV21(data: ByteArray, width: Int, height: Int): ByteArray {
+        val result = ByteArray(data.size)
+        val halfWidth = width / 2
+        val uvOffset = width * height
+
+        // 1. 翻转 Y 分量：每一行左右颠倒
+        for (y in 0 until height) {
+            val srcRowStart = y * width
+            val dstRowStart = y * width
+            for (x in 0 until width) {
+                result[dstRowStart + x] = data[srcRowStart + (width - 1 - x)]
+            }
+        }
+
+        // 2. 翻转 UV 分量
+        // UV 数据排列：每行有 halfWidth 对 UV，每对 2 字节
+        // 对于 height/2 行 UV 数据，每行宽度 = width（字节数 = halfWidth * 2 = width）
+        for (y in 0 until height / 2) {
+            val srcRowStart = uvOffset + y * width
+            val dstRowStart = uvOffset + y * width
+            for (x in 0 until halfWidth) {
+                val srcIdx = srcRowStart + x * 2
+                val dstIdx = dstRowStart + (halfWidth - 1 - x) * 2
+                // 复制一对 UV（2 字节）
+                result[dstIdx] = data[srcIdx]
+                result[dstIdx + 1] = data[srcIdx + 1]
+            }
+        }
+
+        return result
+    }
+
+    /**
+     * NV21 垂直翻转（上下颠倒）。
+     */
+    private fun flipVerticalNV21(data: ByteArray, width: Int, height: Int): ByteArray {
+        val result = ByteArray(data.size)
+        val uvOffset = width * height
+
+        // 1. 翻转 Y 分量：整行复制
+        for (y in 0 until height) {
+            val srcRowStart = y * width
+            val dstRowStart = (height - 1 - y) * width
+            System.arraycopy(data, srcRowStart, result, dstRowStart, width)
+        }
+
+        // 2. 翻转 UV 分量
+        for (y in 0 until height / 2) {
+            val srcRowStart = uvOffset + y * width
+            val dstRowStart = uvOffset + (height / 2 - 1 - y) * width
+            System.arraycopy(data, srcRowStart, result, dstRowStart, width)
+        }
+
+        return result
+    }
+
+    /**
+     * NV21 水平+垂直翻转（旋转 180 度 = 两次翻转）。
+     */
+    private fun flipBothNV21(data: ByteArray, width: Int, height: Int): ByteArray {
+        val horizontal = flipHorizontalNV21(data, width, height)
+        return flipVerticalNV21(horizontal, width, height)
     }
 
     // ========================= SurfaceSlot =========================
@@ -515,6 +696,6 @@ class CameraDevice(
 
 /** 异步打开结果 */
 sealed class OpenResult {
-    data object Success : OpenResult()
+    object Success : OpenResult()
     data class Error(val message: String) : OpenResult()
 }

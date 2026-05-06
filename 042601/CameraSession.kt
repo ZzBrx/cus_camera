@@ -1,4 +1,7 @@
-package com.ruide.camera
+package com.ruide.camera.session
+
+import com.ruide.service.camera.session.ErrorType
+import com.ruide.service.camera.session.SessionState
 
 /**
  * 单个逻辑相机的会话数据。
@@ -11,7 +14,7 @@ package com.ruide.camera
  * @param cameraType 逻辑相机类型
  */
 class CameraSession(
-    val cameraType: com.ruide.aidl.para.CAM.CAM_ID_TYPE
+    val cameraId: Int
 ) {
     @Volatile
     private var _state: SessionState = SessionState.IDLE
@@ -40,6 +43,6 @@ class CameraSession(
     internal fun isError(): Boolean = _state == SessionState.ERROR
 
     override fun toString(): String {
-        return "CameraSession(type=$cameraType, state=$_state, productId=$_realProductId, error=$_errorType)"
+        return "CameraSession(type=$cameraId, state=$_state, productId=$_realProductId, error=$_errorType)"
     }
 }

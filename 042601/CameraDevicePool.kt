@@ -1,8 +1,13 @@
-package com.ruide.camera
+package com.ruide.camera.device
 
 import android.hardware.usb.UsbDevice
 import android.util.Log
+import com.ruide.service.camera.event.CameraEventBus
+import com.ruide.service.camera.event.InternalEvent
 import com.ruide.camera.usb.USBMonitor
+import com.ruide.service.camera.event.CameraHardwareCallback
+import com.ruide.camera.event.DisconnectReason
+import com.ruide.camera.usb.UsbDeviceMonitor
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -75,7 +80,13 @@ class CameraDevicePool(
     /**
      * 仅获取，不创建。
      */
-    fun get(productId: Int): CameraDevice? = devices[productId]
+    fun get(productId: Int): CameraDevice? {
+        val device = devices[productId]
+        if (device == null) {
+            Log.w(TAG, "get: 设备不在池中, productId=$productId, 池中keys=${devices.keys}")
+        }
+        return device
+    }
 
     /**
      * 强制放入（用于已打开的 device）。

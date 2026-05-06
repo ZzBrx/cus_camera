@@ -1,4 +1,4 @@
-package com.ruide.camera
+package com.ruide.service.camera.session
 
 /**
  * CameraSession 的严格状态机。
